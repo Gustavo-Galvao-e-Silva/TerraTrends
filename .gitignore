@@ -1,15 +1,17 @@
-# Default ignored files
-/shelf/
-/workspace.xml
-# Editor-based HTTP Client requests
-/httpRequests/
-# Datasource local storage ignored files
-/dataSources/
-/dataSources.local.xml
-misc.xml
-modules.xml
+# macOS
 .DS_Store
-trained_model.pkl
 
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
 
+# ML artifacts
+*.pkl
+*.pt
+*.pth
 
+# IDE
+.idea/
+.vscode/
