@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# ML artifacts
+*.pkl
+*.pt
+*.pth
+
+# IDE
+.idea/
+.vscode/
