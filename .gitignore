@@ -1,4 +1,6 @@
-/data/output/final_merged_data.csv
+# Data
+data/
+
 # macOS
 .DS_Store
 
