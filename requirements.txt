@@ -6,3 +6,5 @@ numpy
 scikit-learn
 torch
 requests
+tqdm
+pyarrow

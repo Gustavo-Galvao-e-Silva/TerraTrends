@@ -40,7 +40,7 @@ import warnings
 import sys
 warnings.filterwarnings("ignore")
 
-from survival_base_rates import compute_survival_probability
+from survival_base_rates import compute_survival_probability, init_survival_model
 from lstm_forecaster import forecast_multiple_horizons
 
 CURRENT_YEAR   = 2025
@@ -65,7 +65,8 @@ def score_all_counties(
     founding_year: int,
     econ_data: pd.DataFrame,
     model_path: str = "lstm_model_v2.pt",
-    horizon: str = "3y"
+    horizon: str = "3y",
+    qcew_path: str = "data/qcew_long.csv",
 ) -> pd.DataFrame:
     """
     Score all 159 Georgia counties for a given business profile.
@@ -79,6 +80,7 @@ def score_all_counties(
     econ_data       : pd.DataFrame — merged_data.csv
     model_path      : str
     horizon         : str   — '1y', '3y', or '5y'
+    qcew_path       : str   — path to qcew_long.csv
 
     Returns
     -------
@@ -87,6 +89,10 @@ def score_all_counties(
     business_age = max(0, CURRENT_YEAR - founding_year)
     counties     = sorted(econ_data["County"].unique())
     results      = []
+
+    # Initialize QCEW-powered survival model once before the county loop
+    print(f"\nLoading survival model from {qcew_path}...")
+    init_survival_model(qcew_path=qcew_path, merged_path="data/merged_data.csv")
 
     print(f"\nScoring {len(counties)} counties for '{sector}' ({horizon} horizon)...")
     print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
@@ -116,17 +122,24 @@ def score_all_counties(
 
             p_survival = compute_survival_probability(
                 sector=sector,
+                county=county,
                 business_age_years=business_age,
                 employee_count=employee_count,
-                economic_adjustment=fc["economic_adjustment"],
-                horizon=horizon
+                horizon=horizon,
+                forecast_year=BASE_DATA_YEAR,
             )
 
             revenue_score = fc["revenue_score"]
             total_growth  = fc["total_growth"]
-            score         = (0.5 * p_survival + 0.5 * revenue_score) * 100
+            compound      = fc["compound_multiplier"]
 
-            projected_revenue = round(current_revenue * fc["compound_multiplier"], 2) \
+            # Multiplicative expected-value score:
+            #   expected outcome = compound growth × survival probability
+            # Normalised to 0-100 after all counties are scored (below).
+            # Store raw expected value here; normalise after the loop.
+            expected_val  = compound * p_survival
+
+            projected_revenue = round(current_revenue * compound, 2) \
                                 if current_revenue > 0 else np.nan
 
             class_probs = fc.get("class_probs", [None] * 4)
@@ -135,8 +148,9 @@ def score_all_counties(
                 "rank":                None,
                 "county":              county,
                 "population":          int(county_pop) if county_pop else None,
-                "score":               round(score, 2),
-                f"score_{horizon}":    round(score, 2),
+                "score":               None,          # filled after normalisation
+                "expected_val":        expected_val,  # raw, used for normalisation
+                f"score_{horizon}":    None,
                 "survival_prob":       round(p_survival, 4),
                 "revenue_score":       round(revenue_score, 4),
                 "projected_revenue":   projected_revenue,
@@ -148,7 +162,7 @@ def score_all_counties(
                 "p_moderate":          round(class_probs[2], 3) if class_probs[2] is not None else None,
                 "p_strong":            round(class_probs[3], 3) if class_probs[3] is not None else None,
                 "status":              "ok",
-                "notes":               f"pop_dampened" if county_pop and county_pop < POP_DAMPEN_THRESHOLD else "",
+                "notes":               "pop_dampened" if county_pop and county_pop < POP_DAMPEN_THRESHOLD else "",
             })
 
         except Exception as e:
@@ -176,10 +190,39 @@ def score_all_counties(
     print(f"\n✓ Scored {len(results) - errors}/159 counties ({errors} errors)")
 
     df_out = pd.DataFrame(results)
+
+    # Normalise expected_val to 0-100 relative to the best county in this run
+    ok_mask   = df_out["status"] == "ok"
+    ev_max    = df_out.loc[ok_mask, "expected_val"].max()
+    ev_min    = df_out.loc[ok_mask, "expected_val"].min()
+    ev_range  = ev_max - ev_min if ev_max > ev_min else 1.0
+
+    df_out.loc[ok_mask, "score"] = (
+        (df_out.loc[ok_mask, "expected_val"] - ev_min) / ev_range * 100
+    ).round(2)
+    df_out[f"score_{horizon}"] = df_out["score"]
+
+    # Tier labels based on survival and growth
+    def _tier(row):
+        if row["status"] != "ok":
+            return "N/A"
+        surv   = row["survival_prob"]
+        growth = row["sector_growth_pct"]
+        if surv >= 0.62 and growth >= 15:
+            return "Strong Expand"
+        elif surv >= 0.58 or growth >= 10:
+            return "Cautious Expand"
+        elif surv >= 0.50 and growth >= 0:
+            return "Watch"
+        else:
+            return "Avoid"
+
+    df_out["tier"] = df_out.apply(_tier, axis=1)
+
     df_out = df_out.sort_values("score", ascending=False).reset_index(drop=True)
     df_out["rank"] = df_out.index + 1
 
-    cols = ["rank", "county", "population", "score", "survival_prob", "revenue_score",
+    cols = ["rank", "county", "population", "score", "tier", "survival_prob", "revenue_score",
             "projected_revenue", "sector_growth_pct", "annual_growth_rate",
             "economic_adjustment", "p_shrinking", "p_flat", "p_moderate", "p_strong",
             "status", "notes"]
@@ -189,24 +232,26 @@ def score_all_counties(
 
 
 def print_summary(df: pd.DataFrame, sector: str, horizon: str, top_n: int = 10):
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"  TOP {top_n} COUNTIES — {sector[:40]}")
     print(f"  Horizon: {horizon.upper()}")
-    print(f"{'='*60}")
-    print(f"  {'Rank':<5} {'County':<25} {'Score':>6}  {'Survival':>8}  {'Growth':>7}  {'Pop':>10}")
-    print(f"  {'-'*63}")
+    print(f"{'='*70}")
+    print(f"  {'Rank':<5} {'County':<25} {'Score':>6}  {'Survival':>8}  {'Growth':>7}  {'Tier':<16}  {'Pop':>10}")
+    print(f"  {'-'*75}")
     for _, row in df.head(top_n).iterrows():
         pop_str = f"{int(row['population']):,}" if pd.notna(row.get('population')) else "N/A"
         print(f"  {int(row['rank']):<5} {row['county']:<25} {row['score']:>6.1f}  "
-              f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  {pop_str:>10}")
+              f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  "
+              f"{row.get('tier',''):<16}  {pop_str:>10}")
 
     print(f"\n  BOTTOM 5:")
-    print(f"  {'-'*63}")
+    print(f"  {'-'*75}")
     for _, row in df.tail(5).iterrows():
         if row["status"] == "ok":
             pop_str = f"{int(row['population']):,}" if pd.notna(row.get('population')) else "N/A"
             print(f"  {int(row['rank']):<5} {row['county']:<25} {row['score']:>6.1f}  "
-                  f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  {pop_str:>10}")
+                  f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  "
+                  f"{row.get('tier',''):<16}  {pop_str:>10}")
     print()
 
 
@@ -302,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
     parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
     parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
-    parser.add_argument("--horizon",       type=str,   default="3y",   choices=["1y","3y","5y"])
+    parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
 
     parser.add_argument("--input",      type=str, help="Batch input CSV")
     parser.add_argument("--output-dir", type=str, default="rankings/", help="Output dir for batch")

@@ -130,7 +130,10 @@ def _build_input(county, sector, df, pkg):
     start_year = county_df["Year"].iloc[0]
     yi_start   = year2idx.get(start_year, 0)
 
-    lo, hi = winsor_bounds.get(sector, (-np.inf, np.inf))
+    lo, hi        = winsor_bounds.get(sector, (-np.inf, np.inf))
+    qcew_scalers  = pkg.get("qcew_scalers", {})
+    sector_to_qcew = pkg.get("sector_to_qcew", {})
+    qcew_prefix   = sector_to_qcew.get(sector)
 
     for _, row in county_df.iterrows():
         macro_vec = []
@@ -143,7 +146,6 @@ def _build_input(county, sector, df, pkg):
         sv = row.get(sector, np.nan)
         if pd.isna(sv):
             sv = sector_scalers[sector].mean_[0]
-        # FIX: apply same winsorization used during training
         sv = float(np.clip(sv, lo, hi))
         sector_norm = sector_scalers[sector].transform([[sv]])[0][0]
 
@@ -157,7 +159,24 @@ def _build_input(county, sector, df, pkg):
                     neighbor_vals.append(sector_scalers[sector].transform([[nv]])[0][0])
         neighbor_avg = float(np.mean(neighbor_vals)) if neighbor_vals else 0.0
 
-        x_seq.append(macro_vec + [sector_norm, neighbor_avg, 0.0])
+        # QCEW features: employment_growth_rate and wage_growth_rate
+        qcew_emp = qcew_wage = 0.0
+        if qcew_prefix is not None:
+            emp_col  = f"{qcew_prefix}_employment_growth_rate"
+            wage_col = f"{qcew_prefix}_wage_growth_rate"
+            for feat_idx, col in enumerate([emp_col, wage_col]):
+                val = row.get(col, np.nan)
+                scaler = qcew_scalers.get((sector, feat_idx))
+                if pd.isna(val) or scaler is None:
+                    norm = 0.0
+                else:
+                    norm = float(scaler.transform([[val]])[0][0])
+                if feat_idx == 0:
+                    qcew_emp  = norm
+                else:
+                    qcew_wage = norm
+
+        x_seq.append(macro_vec + [sector_norm, neighbor_avg, 0.0, qcew_emp, qcew_wage])
 
     x_t  = torch.tensor([x_seq],      dtype=torch.float32)
     ci_t = torch.tensor([county_idx], dtype=torch.long)

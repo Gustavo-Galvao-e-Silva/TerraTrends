@@ -1,35 +1,4 @@
-"""
-TERRATRENDS LSTM TRAINER v2 (CORRECTED)
-========================================
-Fix log vs original v2:
-
-  BUG 1 (primary): Labels were computed from z-scores, not growth rates.
-    The trainer normalized sector values into z-scores FIRST, then binned them
-    with growth-rate thresholds [-0.05, 0.05, 0.20]. Since z-scores span ~[-3,+3],
-    almost nothing fell in the "flat" or "moderate" bands → distribution collapsed
-    to 49% shrinking / 34% strong → model predicted extreme classes almost always
-    → 100%+ projected revenue growth.
-    FIX: Labels now computed from the RAW rolling-avg growth rate before normalization.
-
-  BUG 2: CLASS_GROWTH_RATES were assumed midpoints unrelated to actual data.
-    The sector values are contribution-to-GDP-growth in percentage points, not
-    sector growth rates. Using data-derived medians as CLASS_GROWTH_RATES produced
-    wildly unrealistic revenue projections (56%/yr for "strong").
-    FIX: CLASS_GROWTH_RATES replaced with defensible nominal annual business revenue
-    growth rates that correspond to each economic signal class:
-      shrinking → -5%/yr, flat → +2%/yr, moderate → +6%/yr, strong → +12%/yr
-    These yield realistic 3-year outcomes: -14% / +6% / +19% / +40%.
-
-  BUG 3: Outlier distortion from small rural counties.
-    Some sectors (Agriculture, Natural Resources, Real Estate) have extreme values
-    from small counties where one establishment moves the contribution metric by 400%+.
-    FIX: Per-sector winsorization at p2/p98 before fitting scalers.
-
-Architecture changes vs original v2:
-  - HIDDEN_SIZE reduced 128 → 64 (reduces overfitting; train/val gap was 0.53/0.87)
-  - DROPOUT increased 0.3 → 0.4 (same reason)
-  - All else unchanged
-
+"""""
 Architecture:
   - Sector embedding   (20 sectors   → 8-dim)
   - County embedding   (159 counties → 16-dim)
@@ -84,11 +53,7 @@ N_NEIGHBORS      = 3
 CLASS_BINS   = [-np.inf, -0.05, 0.05, 0.20, np.inf]
 CLASS_LABELS = ["shrinking", "flat", "moderate", "strong"]
 
-# Defensible nominal annual business revenue growth rates per economic signal class.
-# Sector values are contribution-to-GDP-growth in pp, not sector growth rates directly.
-# "strong" (>0.20pp contribution) does NOT mean 56%/yr business growth — it means
-# the sector is a strong local economic contributor, which corresponds to ~12%/yr
-# nominal business revenue growth in favorable conditions.
+
 CLASS_GROWTH_RATES = {
     0: -0.05,   # shrinking sector contribution → business ~-5%/yr
     1:  0.02,   # flat sector → business ~+2%/yr (roughly inflation)
@@ -127,6 +92,31 @@ SECTOR_COLS = [
     'Utilities',
     'Wholesale trade'
 ]
+
+# Maps BEA sector name → QCEW column prefix
+# Sectors with no QCEW coverage get None (will use 0.0 at input time)
+SECTOR_TO_QCEW = {
+    'Accommodation and food services':                                          'accom',
+    'Administrative and support and waste management and remediation services': 'admin',
+    'Agriculture, forestry, fishing and hunting':                               None,
+    'Arts, entertainment, and recreation':                                      'arts',
+    'Construction':                                                             'const',
+    'Durable goods manufacturing':                                              None,
+    'Educational services':                                                     'edu',
+    'Finance and insurance':                                                    'finance',
+    'Government and government enterprises':                                    'govt',
+    'Health care and social assistance':                                        'health',
+    'Information':                                                              'info',
+    'Natural resources and mining':                                             None,
+    'Nondurable goods manufacturing':                                           None,
+    'Other services (except government and government enterprises)':            'other_svc',
+    'Professional and business services':                                       'professional',
+    'Real estate and rental and leasing':                                       'realestate',
+    'Retail trade':                                                             'retail',
+    'Transportation and warehousing':                                           'transport',
+    'Utilities':                                                                'utilities',
+    'Wholesale trade':                                                          'wholesale',
+}
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -304,8 +294,7 @@ GA_NEIGHBORS = {
 # Load & preprocess
 # -------------------------------------------------------------------
 print("\nLoading data...")
-df = pd.read_csv("data/merged_data.csv").sort_values(["County", "Year"])
-df = df[df["Year"] != 2020].reset_index(drop=True)
+df = pd.read_csv("data/merged_data_v2.csv")  # includes QCEW employment+wage growth rates.sort_values(["County", "Year"])
 
 counties   = sorted(df["County"].unique())
 fips_list  = sorted(df["GeoID"].unique())
@@ -320,7 +309,7 @@ N_YEARS   = len(years)
 N_COUNTIES = len(counties)
 N_SECTORS  = len(SECTOR_COLS)
 
-print(f"✓ {N_COUNTIES} counties, {N_SECTORS} sectors, {N_YEARS} years (2020 excluded)")
+print(f"✓ {N_COUNTIES} counties, {N_SECTORS} sectors, {N_YEARS}")
 
 # -------------------------------------------------------------------
 # FIX 1: Winsorize per-sector at p2/p98 BEFORE any other processing
@@ -439,6 +428,54 @@ for county in counties:
 
 print(f"✓ Arrays: sector={sector_arr.shape}, labels={label_arr.shape}")
 
+# -------------------------------------------------------------------
+# QCEW arrays: employment_growth_rate and wage_growth_rate per sector
+# Shape: [N_COUNTIES, N_YEARS, N_SECTORS, 2]
+# For sectors with no QCEW coverage, values stay 0.0
+# -------------------------------------------------------------------
+print("Building QCEW arrays...")
+qcew_scalers = {}   # key: (sector, feature_type) → StandardScaler
+qcew_arr     = np.zeros((N_COUNTIES, N_YEARS, N_SECTORS, 2), dtype=np.float32)
+
+for si, sector in enumerate(SECTOR_COLS):
+    prefix = SECTOR_TO_QCEW.get(sector)
+    if prefix is None:
+        continue   # stays 0.0
+
+    emp_col  = f"{prefix}_employment_growth_rate"
+    wage_col = f"{prefix}_wage_growth_rate"
+
+    # Fit scalers on non-null values
+    for feat_idx, col in enumerate([emp_col, wage_col]):
+        vals = df[col].dropna().values.reshape(-1, 1)
+        scaler = StandardScaler()
+        scaler.fit(vals)
+        qcew_scalers[(sector, feat_idx)] = scaler
+
+    # Impute: ffill/bfill within county, then global mean
+    df_qcew = df.copy()
+    for col in [emp_col, wage_col]:
+        for county in counties:
+            mask = df_qcew["County"] == county
+            df_qcew.loc[mask, col] = df_qcew.loc[mask, col].ffill().bfill()
+        df_qcew[col] = df_qcew[col].fillna(df_qcew[col].mean())
+
+    # Fill array
+    for county in counties:
+        ci   = county2idx[county]
+        cdf  = df_qcew[df_qcew["County"] == county].sort_values("Year")
+        for year in years:
+            yi   = year2idx[year]
+            row  = cdf[cdf["Year"] == year]
+            if row.empty:
+                continue
+            for feat_idx, col in enumerate([emp_col, wage_col]):
+                raw  = row[col].values[0]
+                norm = qcew_scalers[(sector, feat_idx)].transform([[raw]])[0][0]
+                qcew_arr[ci, yi, si, feat_idx] = norm
+
+print(f"✓ QCEW array built: {qcew_arr.shape}")
+
 # Verify corrected label distribution
 all_labels    = label_arr.flatten()
 class_counts  = np.bincount(all_labels, minlength=N_CLASSES).astype(int)
@@ -482,7 +519,7 @@ print(f"\nClass weights: {class_weights.numpy().round(3)}")
 # -------------------------------------------------------------------
 # Dataset
 # -------------------------------------------------------------------
-INPUT_SIZE = len(MACRO_FEATURES) + 1 + 1 + 1  # macro + sector + neighbor + mask
+INPUT_SIZE = len(MACRO_FEATURES) + 1 + 1 + 1 + 2  # macro + sector + neighbor + mask + qcew(emp,wage)
 
 class TerraDataset(Dataset):
     def __init__(self, samples):
@@ -511,9 +548,16 @@ def build_samples(split="train"):
             for t in range(max_start + 1):
                 target_start = t + SEQ_LEN
 
-                if split == "train" and target_start > 13: continue
-                if split == "val"   and target_start != 14: continue
-                if split == "test"  and target_start <= 14: continue
+                target_year = years[target_start]
+
+                if split == "train" and target_year <= 2018:
+                    pass
+                elif split == "val" and target_year == 2019:
+                    pass
+                elif split == "test" and target_year >= 2020:
+                    pass
+                else:
+                    continue
 
                 x_seq = []
                 for ti in range(t, t + SEQ_LEN):
@@ -521,7 +565,10 @@ def build_samples(split="train"):
                     sector_val   = float(sector_arr[ci, ti, si])
                     neighbor_val = get_neighbor_avg(ci, si, ti)
                     imputed_mask = 0.0
-                    x_seq.append(macro_vec + [sector_val, neighbor_val, imputed_mask])
+                    # QCEW: employment_growth_rate and wage_growth_rate for this sector
+                    qcew_emp  = float(qcew_arr[ci, ti, si, 0])
+                    qcew_wage = float(qcew_arr[ci, ti, si, 1])
+                    x_seq.append(macro_vec + [sector_val, neighbor_val, imputed_mask, qcew_emp, qcew_wage])
 
                 y_labels = label_arr[ci, target_start:target_start + FORECAST_HORIZON, si]
                 if len(y_labels) < FORECAST_HORIZON:
@@ -549,7 +596,7 @@ val_loader   = DataLoader(TerraDataset(val_samples),   batch_size=BATCH_SIZE, sh
 test_loader  = DataLoader(TerraDataset(test_samples),  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # -------------------------------------------------------------------
-# Model (unchanged from original v2)
+# Model
 # -------------------------------------------------------------------
 class TerraLSTM(nn.Module):
     def __init__(self):
@@ -723,6 +770,28 @@ print(f"\n  Confusion matrix (all sectors):")
 print(confusion_matrix(all_true, all_pred))
 print(f"  Classes: {CLASS_LABELS}")
 
+# -------------------------------------------------------------------
+# Binary evaluation: Growing (moderate+strong) vs Not-Growing
+# -------------------------------------------------------------------
+from sklearn.metrics import roc_auc_score
+
+y_true_arr = np.array(all_true)
+y_pred_arr = np.array(all_pred)
+
+y_true_bin = (y_true_arr >= 2).astype(int)
+y_pred_bin = (y_pred_arr >= 2).astype(int)
+
+binary_acc = np.mean(y_true_bin == y_pred_bin)
+binary_f1  = f1_score(y_true_bin, y_pred_bin)
+binary_cm  = confusion_matrix(y_true_bin, y_pred_bin)
+
+print("\nBinary Growing vs Not-Growing:")
+print(f"  F1_binary = {binary_f1:.3f}")
+print(f"  Acc_binary = {binary_acc:.3f}")
+print("  Confusion matrix:")
+print(binary_cm)
+
+
 eval_df = pd.DataFrame(eval_results).T.sort_values("F1_macro", ascending=False)
 eval_df.to_csv("lstm_eval_v2.csv")
 print(f"\n✓ Eval saved to lstm_eval_v2.csv")
@@ -758,6 +827,8 @@ torch.save({
     "sector_scalers":     sector_scalers,
     "macro_scalers":      macro_scalers,
     "sector_winsor_bounds": sector_winsor_bounds,   # saved for inference-time clipping
+    "qcew_scalers":       qcew_scalers,
+    "sector_to_qcew":     SECTOR_TO_QCEW,
     "class_bins":         CLASS_BINS,
     "class_labels":       CLASS_LABELS,
     "class_growth_rates": CLASS_GROWTH_RATES,
