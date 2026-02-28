@@ -720,13 +720,13 @@ for epoch in range(1, EPOCHS + 1):
         break
 
 model.load_state_dict(best_state)
-print(f"\n✓ Best val loss: {best_val_loss:.4f}")
+print(f"\nBest val loss: {best_val_loss:.4f}")
 
 # -------------------------------------------------------------------
 # Evaluation
 # -------------------------------------------------------------------
 print("\n" + "="*70)
-print("EVALUATION (test set)")
+print("Evaluation)")
 print("="*70)
 
 model.eval()
@@ -796,9 +796,7 @@ eval_df = pd.DataFrame(eval_results).T.sort_values("F1_macro", ascending=False)
 eval_df.to_csv("lstm_eval_v2.csv")
 print(f"\n✓ Eval saved to lstm_eval_v2.csv")
 
-# -------------------------------------------------------------------
-# Save
-# -------------------------------------------------------------------
+# save
 print("\nSaving...")
 torch.save({
     "model_state":       best_state,
@@ -826,7 +824,7 @@ torch.save({
     "ga_neighbors":       GA_NEIGHBORS,
     "sector_scalers":     sector_scalers,
     "macro_scalers":      macro_scalers,
-    "sector_winsor_bounds": sector_winsor_bounds,   # saved for inference-time clipping
+    "sector_winsor_bounds": sector_winsor_bounds,
     "qcew_scalers":       qcew_scalers,
     "sector_to_qcew":     SECTOR_TO_QCEW,
     "class_bins":         CLASS_BINS,
@@ -836,5 +834,4 @@ torch.save({
     "model_version":      "terratrends_lstm_v2_fixed",
 }, "lstm_model_v2.pt")
 
-print("✓ Saved to lstm_model_v2.pt")
-print("="*70 + "\n")
+print("Saved to lstm_model_v2.pt")

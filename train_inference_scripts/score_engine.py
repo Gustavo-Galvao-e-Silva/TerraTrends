@@ -92,7 +92,7 @@ def score_all_counties(
 
     # Initialize QCEW-powered survival model once before the county loop
     print(f"\nLoading survival model from {qcew_path}...")
-    init_survival_model(qcew_path=qcew_path, merged_path="data/merged_data.csv")
+    init_survival_model(qcew_path=qcew_path, merged_path="data/merged_data_v2.csv")
 
     print(f"\nScoring {len(counties)} counties for '{sector}' ({horizon} horizon)...")
     print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
@@ -266,7 +266,7 @@ def run_single(
     horizon: str = "3y"
 ):
     print("\n" + "="*60)
-    print("  TERRATRENDS — COUNTY EXPANSION RANKER")
+    print("Ranked county expansion")
     print("="*60)
 
     econ_data = pd.read_csv(data_path).sort_values(["County", "Year"])
@@ -285,7 +285,6 @@ def run_single(
     print_summary(ranked, sector, horizon)
 
     ranked.to_csv(output_path, index=False)
-    print(f"✓ Full rankings saved to: {output_path}")
     print("="*60 + "\n")
 
     return ranked
@@ -329,10 +328,6 @@ def run_batch(
             horizon=horizon
         )
 
-        safe_name = "".join(c if c.isalnum() else "_" for c in name)
-        out_path  = os.path.join(output_dir, f"{safe_name}_rankings.csv")
-        ranked.to_csv(out_path, index=False)
-
         print_summary(ranked, str(biz["sector"]), horizon, top_n=5)
         print(f"  Saved: {out_path}")
 
@@ -350,10 +345,9 @@ if __name__ == "__main__":
     parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
 
     parser.add_argument("--input",      type=str, help="Batch input CSV")
-    parser.add_argument("--output-dir", type=str, default="rankings/", help="Output dir for batch")
 
     parser.add_argument("--output", type=str, default="county_rankings.csv")
-    parser.add_argument("--data",   type=str, default="data/merged_data.csv")
+    parser.add_argument("--data",   type=str, default="data/merged_data_v2.csv")
     parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
 
     args = parser.parse_args()

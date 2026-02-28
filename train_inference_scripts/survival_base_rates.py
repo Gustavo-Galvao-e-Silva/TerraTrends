@@ -1,14 +1,4 @@
 """
-SURVIVAL BASE RATES v2
-========================
-Replaces the original survival_base_rates.py with a county- and
-sector-specific survival model powered by QCEW employment/wage data.
-
-The original model had one county-specific input: the LSTM economic
-adjustment — a GDP-contribution proxy that double-counted the revenue
-signal. It produced a survival spread of only ~0.11 across all 159
-counties for the same business.
-
 This model uses five independent signals, producing a ~0.25+ spread
 that meaningfully differentiates county survival environments.
 
@@ -76,7 +66,6 @@ SURVIVAL_RATES = {
 }
 DEFAULT_SURVIVAL = {"1y": 0.81, "3y": 0.57, "5y": 0.44}
 
-# Business age multipliers (unchanged from v1)
 AGE_MULTIPLIERS = {
     (0,   1):  1.00,
     (2,   3):  1.08,
@@ -86,7 +75,6 @@ AGE_MULTIPLIERS = {
     (21, 999): 1.35,
 }
 
-# Business size multipliers (unchanged from v1)
 SIZE_MULTIPLIERS = {
     (1,    4):     0.90,
     (5,   19):     1.00,
@@ -176,9 +164,6 @@ def _volatility_mult(emp_volatility) -> float:
     return float(np.clip(1.0 - penalty, 0.85, 1.00))
 
 
-# -------------------------------------------------------------------
-# Signal lookup table — precomputed at load time for fast inference
-# -------------------------------------------------------------------
 class SurvivalModel:
     """
     County- and sector-specific survival probability model.
@@ -354,7 +339,6 @@ def compute_survival_probability(
     employee_count: int,
     horizon: str,
     forecast_year: int = 2023,
-    # Legacy param kept for backward compatibility — no longer used
     economic_adjustment: float = None,
 ) -> float:
     """
@@ -378,20 +362,3 @@ def compute_survival_probability(
         horizon=horizon,
         forecast_year=forecast_year,
     )
-
-
-def _legacy_compute(
-    sector: str,
-    business_age_years: float,
-    employee_count: int,
-    economic_adjustment: float,
-    horizon: str,
-) -> float:
-    """Original v1 calculation — used as fallback only."""
-    rates = SURVIVAL_RATES.get(sector, DEFAULT_SURVIVAL)
-    base  = rates.get(horizon, DEFAULT_SURVIVAL[horizon])
-    age_mult  = _get_range_multiplier(business_age_years, AGE_MULTIPLIERS)
-    size_mult = _get_range_multiplier(employee_count, SIZE_MULTIPLIERS)
-    logit_base    = np.log(base / (1.0 - base))
-    logit_adjusted = logit_base + np.log(age_mult) + np.log(size_mult) + np.log(max(0.5, economic_adjustment))
-    return float(np.clip(1.0 / (1.0 + np.exp(-logit_adjusted)), 0.01, 0.98))
