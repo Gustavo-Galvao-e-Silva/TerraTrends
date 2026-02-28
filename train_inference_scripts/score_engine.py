@@ -1,37 +1,5 @@
-"""
-TERRATRENDS SCORE ENGINE v2 (CORRECTED)
-========================================
-Given a business's details, scores all 159 Georgia counties and
-returns them ranked best-to-worst for expansion.
-
-Changes vs original:
-  1. Passes county population to forecast_multiple_horizons() so the
-     forecaster can apply small-county confidence dampening. Counties
-     under 40k pop have class probabilities pulled toward uniform to
-     prevent single-establishment noise from producing extreme scores.
-  2. Population column added to output CSV for transparency.
-  3. No other interface changes.
-
-Flow:
-  1. User inputs: sector, revenue, employee_count, founding_year
-  2. For each of 159 counties:
-       - Run LSTM forecast for that county + sector (with pop dampening)
-       - Compute survival probability (adjusted for county outlook)
-       - Compute revenue score from projected growth
-       - Score = (0.5 * P_survival + 0.5 * revenue_score) * 100
-  3. Return all 159 counties ranked by score
-
-Usage:
-  python score_engine.py --sector "Health care and social assistance" \
-                         --revenue 500000 \
-                         --employees 8 \
-                         --founding-year 2015 \
-                         --horizon 3y \
-                         --output results.csv
-
-  python score_engine.py --input business.csv --output results.csv
-  (CSV must have: sector, current_revenue, employee_count, founding_year)
-"""
+# Score engine
+# Runs inference on 
 
 import argparse
 import pandas as pd
@@ -47,13 +15,11 @@ CURRENT_YEAR   = 2025
 BASE_DATA_YEAR = 2023
 HORIZONS       = ["1y", "3y", "5y"]
 
-# Population dampening threshold (passed to forecaster).
-# Counties below this have class probabilities pulled toward uniform.
+# Population dampening threshold --> counties below this have class probabilities pulled toward uniform.
 POP_DAMPEN_THRESHOLD = 40_000
 
-
+# change this later to get population data from 2026
 def _get_county_pop(county: str, econ_data: pd.DataFrame) -> float:
-    """Return the most recent non-null population for a county."""
     rows = econ_data[econ_data["County"] == county]["TOT_POP"].dropna()
     return float(rows.iloc[-1]) if len(rows) > 0 else None
 
@@ -90,10 +56,8 @@ def score_all_counties(
     counties     = sorted(econ_data["County"].unique())
     results      = []
 
-    # Initialize QCEW-powered survival model once before the county loop
-    print(f"\nLoading survival model from {qcew_path}...")
     init_survival_model(qcew_path=qcew_path, merged_path="data/merged_data_v2.csv")
-
+    
     print(f"\nScoring {len(counties)} counties for '{sector}' ({horizon} horizon)...")
     print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
     print("-" * 60)
@@ -104,7 +68,6 @@ def score_all_counties(
             print(f"  {i}/{len(counties)} counties scored...", end="\r")
 
         try:
-            # Look up population for small-county dampening
             county_pop = _get_county_pop(county, econ_data)
 
             forecasts = forecast_multiple_horizons(
@@ -113,7 +76,7 @@ def score_all_counties(
                 df=econ_data,
                 base_year=BASE_DATA_YEAR,
                 model_path=model_path,
-                county_pop=county_pop,       # NEW: enables population dampening
+                county_pop=county_pop, # for population dampening
             )
 
             fc = forecasts.get(horizon)
@@ -134,9 +97,9 @@ def score_all_counties(
             compound      = fc["compound_multiplier"]
 
             # Multiplicative expected-value score:
-            #   expected outcome = compound growth × survival probability
-            # Normalised to 0-100 after all counties are scored (below).
-            # Store raw expected value here; normalise after the loop.
+            # Expected outcome = compound growth × survival probability
+            # Normalized to 0-100 after all counties are scored
+            # Store raw expected value here and normalize after the loop.
             expected_val  = compound * p_survival
 
             projected_revenue = round(current_revenue * compound, 2) \
@@ -148,8 +111,8 @@ def score_all_counties(
                 "rank":                None,
                 "county":              county,
                 "population":          int(county_pop) if county_pop else None,
-                "score":               None,          # filled after normalisation
-                "expected_val":        expected_val,  # raw, used for normalisation
+                "score":               None,          # filled after normalization
+                "expected_val":        expected_val,  # raw, used for normalization
                 f"score_{horizon}":    None,
                 "survival_prob":       round(p_survival, 4),
                 "revenue_score":       round(revenue_score, 4),
@@ -255,12 +218,11 @@ def print_summary(df: pd.DataFrame, sector: str, horizon: str, top_n: int = 10):
     print()
 
 
-def run_single(
+def predict(
     sector: str,
     current_revenue: float,
     employee_count: int,
     founding_year: int,
-    output_path: str,
     data_path: str,
     model_path: str,
     horizon: str = "3y"
@@ -283,60 +245,11 @@ def run_single(
     )
 
     print_summary(ranked, sector, horizon)
-
-    ranked.to_csv(output_path, index=False)
-    print("="*60 + "\n")
-
     return ranked
 
-
-def run_batch(
-    input_path: str,
-    output_dir: str,
-    data_path: str,
-    model_path: str,
-    horizon: str = "3y"
-):
-    """
-    Batch mode: read multiple businesses from CSV, output one
-    ranked CSV per business into output_dir.
-
-    Input CSV columns: business_name, sector, current_revenue,
-                       employee_count, founding_year
-    """
-    import os
-    os.makedirs(output_dir, exist_ok=True)
-
-    businesses = pd.read_csv(input_path)
-    econ_data  = pd.read_csv(data_path).sort_values(["County", "Year"])
-
-    print(f"\n{'='*60}")
-    print(f"  BATCH MODE — {len(businesses)} businesses")
-    print(f"{'='*60}\n")
-
-    for _, biz in businesses.iterrows():
-        name = biz.get("business_name", f"business_{_}")
-        print(f"\n>>> {name}")
-
-        ranked = score_all_counties(
-            sector=str(biz["sector"]),
-            current_revenue=float(biz.get("current_revenue", 0)),
-            employee_count=int(biz.get("employee_count", 5)),
-            founding_year=int(biz.get("founding_year", CURRENT_YEAR - 5)),
-            econ_data=econ_data,
-            model_path=model_path,
-            horizon=horizon
-        )
-
-        print_summary(ranked, str(biz["sector"]), horizon, top_n=5)
-        print(f"  Saved: {out_path}")
-
-
-# -------------------------------------------------------------------
-# CLI
-# -------------------------------------------------------------------
+# CLi
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TerraTraends County Expansion Ranker")
+    parser = argparse.ArgumentParser(description="TerraTrends County Expansion Ranker")
 
     parser.add_argument("--sector",        type=str,   help="Business sector")
     parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
@@ -345,22 +258,17 @@ if __name__ == "__main__":
     parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
 
     parser.add_argument("--input",      type=str, help="Batch input CSV")
-
-    parser.add_argument("--output", type=str, default="county_rankings.csv")
     parser.add_argument("--data",   type=str, default="data/merged_data_v2.csv")
     parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
 
     args = parser.parse_args()
 
-    if args.input:
-        run_batch(args.input, args.output_dir, args.data, args.model, args.horizon)
-    elif args.sector:
-        run_single(
+    if args.sector:
+        predict(
             sector=args.sector,
             current_revenue=args.revenue,
             employee_count=args.employees,
             founding_year=args.founding_year,
-            output_path=args.output,
             data_path=args.data,
             model_path=args.model,
             horizon=args.horizon

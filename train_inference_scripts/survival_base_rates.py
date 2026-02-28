@@ -347,13 +347,6 @@ def compute_survival_probability(
     """
     global _default_model
 
-    if _default_model is None:
-        # Graceful fallback to legacy model if QCEW data not loaded
-        return _legacy_compute(
-            sector, business_age_years, employee_count,
-            economic_adjustment or 1.0, horizon
-        )
-
     return _default_model.compute(
         sector=sector,
         county=county,
