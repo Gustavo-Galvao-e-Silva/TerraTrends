@@ -1,11 +1,6 @@
-business_name,county,sector,current_revenue,employee_count,founding_year
-Peach Street Diner,"Peach, GA",Accommodation and food services,380000,7,2019
-Savannah Logistics Co,"Chatham, GA",Transportation and warehousing,2400000,34,2014
-Blue Ridge Outfitters,"Rabun, GA","Arts, entertainment, and recreation",210000,5,2017
-Macon Medical Group,"Bibb, GA",Health care and social assistance,4100000,52,2003
-Augusta Tech Staffing,"Richmond, GA",Administrative and support and waste management and remediation services,760000,11,2016
-Valdosta Farm Supply,"Lowndes, GA","Agriculture, forestry, fishing and hunting",590000,8,1998
-Columbus Financial Advisors,"Muscogee, GA",Finance and insurance,1050000,14,2009
-Athens Retail Partners,"Clarke, GA",Retail trade,830000,18,2011
-Gainesville Manufacturing,"Hall, GA",Durable goods manufacturing,3200000,67,2001
-Albany Energy Services,"Dougherty, GA",Utilities,1800000,23,2007
+business_name,sector,current_revenue,employee_count,founding_year
+Peach Street Diner,Accommodation and food services,380000,7,2019
+Savannah Logistics Co,Transportation and warehousing,2400000,34,2014
+Macon Medical Group,Health care and social assistance,4100000,52,2003
+Gainesville Manufacturing,Durable goods manufacturing,3200000,67,2001
+Athens Retail Partners,Retail trade,830000,18,2011

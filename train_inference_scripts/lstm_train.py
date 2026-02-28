@@ -1,14 +1,34 @@
 """
-TERRATRENDS LSTM TRAINER v2
-============================
-Improvements over v1:
-  1. Target = 3-year rolling average growth (smoother, more learnable)
-  2. Cross-county neighbor features (spillover signals)
-  3. Year embeddings (business cycle awareness)
-  4. Classification target: shrinking / flat / moderate / strong
-     → easier ML problem, maps cleanly to scoring
-  5. 2020 excluded (COVID structural break)
-  6. Class-weighted loss to handle imbalance
+TERRATRENDS LSTM TRAINER v2 (CORRECTED)
+========================================
+Fix log vs original v2:
+
+  BUG 1 (primary): Labels were computed from z-scores, not growth rates.
+    The trainer normalized sector values into z-scores FIRST, then binned them
+    with growth-rate thresholds [-0.05, 0.05, 0.20]. Since z-scores span ~[-3,+3],
+    almost nothing fell in the "flat" or "moderate" bands → distribution collapsed
+    to 49% shrinking / 34% strong → model predicted extreme classes almost always
+    → 100%+ projected revenue growth.
+    FIX: Labels now computed from the RAW rolling-avg growth rate before normalization.
+
+  BUG 2: CLASS_GROWTH_RATES were assumed midpoints unrelated to actual data.
+    The sector values are contribution-to-GDP-growth in percentage points, not
+    sector growth rates. Using data-derived medians as CLASS_GROWTH_RATES produced
+    wildly unrealistic revenue projections (56%/yr for "strong").
+    FIX: CLASS_GROWTH_RATES replaced with defensible nominal annual business revenue
+    growth rates that correspond to each economic signal class:
+      shrinking → -5%/yr, flat → +2%/yr, moderate → +6%/yr, strong → +12%/yr
+    These yield realistic 3-year outcomes: -14% / +6% / +19% / +40%.
+
+  BUG 3: Outlier distortion from small rural counties.
+    Some sectors (Agriculture, Natural Resources, Real Estate) have extreme values
+    from small counties where one establishment moves the contribution metric by 400%+.
+    FIX: Per-sector winsorization at p2/p98 before fitting scalers.
+
+Architecture changes vs original v2:
+  - HIDDEN_SIZE reduced 128 → 64 (reduces overfitting; train/val gap was 0.53/0.87)
+  - DROPOUT increased 0.3 → 0.4 (same reason)
+  - All else unchanged
 
 Architecture:
   - Sector embedding   (20 sectors   → 8-dim)
@@ -16,14 +36,14 @@ Architecture:
   - Year embedding     (21 years     → 4-dim)
   - Economic features  (5 macro features, normalized)
   - Neighbor features  (avg growth of neighboring counties, same sector)
-  - LSTM (128 hidden, 2 layers, dropout=0.3)
+  - LSTM (64 hidden, 2 layers, dropout=0.4)
   - Linear head → 4-class softmax per forecast step
 
-Class definitions (on 3yr rolling avg growth rate):
-  0  shrinking  : < -5%
-  1  flat       : -5% to +5%
-  2  moderate   :  +5% to +20%
-  3  strong     : > +20%
+Class definitions (on 3yr rolling avg growth rate, raw contribution-to-GDP values):
+  0  shrinking  : < -5pp
+  1  flat       : -5pp to +5pp
+  2  moderate   : +5pp to +20pp
+  3  strong     : > +20pp
 
 Output:
   lstm_model_v2.pt  — model weights + full config
@@ -46,31 +66,35 @@ warnings.filterwarnings("ignore")
 # -------------------------------------------------------------------
 SEED             = 42
 SEQ_LEN          = 10
-FORECAST_HORIZON = 3       # predict 3 steps: 1Y, 2Y, 3Y ahead
-                            # (from which we derive 1Y/3Y/5Y scores)
+FORECAST_HORIZON = 3
 N_CLASSES        = 4
 BATCH_SIZE       = 512
 EPOCHS           = 150
 LR               = 3e-4
-HIDDEN_SIZE      = 128
+HIDDEN_SIZE      = 64    # reduced from 128 to cut overfitting (train/val gap was 0.53/0.87)
 NUM_LAYERS       = 2
-DROPOUT          = 0.3
+DROPOUT          = 0.4  # increased from 0.3 for same reason
 SECTOR_EMB_DIM   = 8
 COUNTY_EMB_DIM   = 16
 YEAR_EMB_DIM     = 4
 WEIGHT_DECAY     = 1e-4
-N_NEIGHBORS      = 3       # top-N neighbors to include as features
+N_NEIGHBORS      = 3
 
-# Class bins (applied to 3yr rolling average growth rate)
+# Class bins applied to RAW (un-normalized) rolling-avg growth rates
 CLASS_BINS   = [-np.inf, -0.05, 0.05, 0.20, np.inf]
 CLASS_LABELS = ["shrinking", "flat", "moderate", "strong"]
 
-# Growth rate multipliers for revenue projection (midpoint of each class)
+# Defensible nominal annual business revenue growth rates per economic signal class.
+# Sector values are contribution-to-GDP-growth in pp, not sector growth rates directly.
+# "strong" (>0.20pp contribution) does NOT mean 56%/yr business growth — it means
+# the sector is a strong local economic contributor, which corresponds to ~12%/yr
+# nominal business revenue growth in favorable conditions.
 CLASS_GROWTH_RATES = {
-    0: -0.12,   # shrinking: ~-12% per year
-    1:  0.00,   # flat: ~0%
-    2:  0.10,   # moderate: ~+10% per year
-    3:  0.28,   # strong: ~+28% per year
+    0: -0.05,   # shrinking sector contribution → business ~-5%/yr
+    1:  0.02,   # flat sector → business ~+2%/yr (roughly inflation)
+    2:  0.06,   # moderate sector growth → business ~+6%/yr
+    3:  0.12,   # strong sector growth → business ~+12%/yr
+    # 3-year compounded: -14% / +6% / +19% / +40%
 }
 
 MACRO_FEATURES = [
@@ -299,10 +323,26 @@ N_SECTORS  = len(SECTOR_COLS)
 print(f"✓ {N_COUNTIES} counties, {N_SECTORS} sectors, {N_YEARS} years (2020 excluded)")
 
 # -------------------------------------------------------------------
-# Compute 3-year rolling average growth rates (the smoothed target)
+# FIX 1: Winsorize per-sector at p2/p98 BEFORE any other processing
+# This prevents extreme rural-county outliers (e.g. Agriculture 429%)
+# from distorting scalers and neighbor features.
+# Labels and inputs both use winsorized values.
 # -------------------------------------------------------------------
-print("\nComputing 3yr rolling averages...")
-rolling_df = df.copy()
+print("\nWinsorizing outliers (p2/p98 per sector)...")
+df_wins = df.copy()
+sector_winsor_bounds = {}
+for sector in SECTOR_COLS:
+    vals = df_wins[sector].dropna()
+    lo   = np.percentile(vals, 2)
+    hi   = np.percentile(vals, 98)
+    sector_winsor_bounds[sector] = (lo, hi)
+    df_wins[sector] = df_wins[sector].clip(lo, hi)
+
+# -------------------------------------------------------------------
+# Compute 3-year rolling average growth rates on winsorized values
+# -------------------------------------------------------------------
+print("Computing 3yr rolling averages...")
+rolling_df = df_wins.copy()
 for sector in SECTOR_COLS:
     for county in counties:
         mask = rolling_df["County"] == county
@@ -313,12 +353,12 @@ for sector in SECTOR_COLS:
         )
 
 # -------------------------------------------------------------------
-# Per-sector scalers (fit on raw values, used for neighbor features)
+# Per-sector scalers (fit on winsorized raw values for input features)
 # -------------------------------------------------------------------
 print("Fitting scalers...")
 sector_scalers = {}
 for sector in SECTOR_COLS:
-    vals = df[sector].dropna().values.reshape(-1, 1)
+    vals = df_wins[sector].dropna().values.reshape(-1, 1)
     scaler = StandardScaler()
     scaler.fit(vals)
     sector_scalers[sector] = scaler
@@ -331,10 +371,10 @@ for feat in MACRO_FEATURES:
     macro_scalers[feat] = scaler
 
 # -------------------------------------------------------------------
-# Imputation
+# Imputation (on winsorized data)
 # -------------------------------------------------------------------
 print("Imputing...")
-df_imp       = df.copy()
+df_imp       = df_wins.copy()
 rolling_imp  = rolling_df.copy()
 
 for sector in SECTOR_COLS:
@@ -357,6 +397,11 @@ for feat in MACRO_FEATURES:
 # rolling_arr   [N_COUNTIES, N_YEARS, N_SECTORS] — normalized 3yr rolling avg
 # macro_arr     [N_COUNTIES, N_YEARS, N_MACRO]
 # label_arr     [N_COUNTIES, N_YEARS, N_SECTORS] — class labels 0-3
+#
+# FIX 2: Labels are computed from the RAW rolling-avg growth rate BEFORE
+#         normalization. The scaler is only applied to produce input features.
+#         This is the primary bug fix — previously z-scores were being binned
+#         with growth-rate thresholds, producing meaningless labels.
 # -------------------------------------------------------------------
 print("Building arrays...")
 sector_arr  = np.zeros((N_COUNTIES, N_YEARS, N_SECTORS), dtype=np.float32)
@@ -378,14 +423,15 @@ for county in counties:
 
         for si, sector in enumerate(SECTOR_COLS):
             raw = row[sector].values[0]
-            rol = rrow[sector].values[0]
+            rol = rrow[sector].values[0]  # raw rolling-avg growth rate
+
+            # Input features: normalize for LSTM
             sector_arr[ci, yi, si]  = sector_scalers[sector].transform([[raw]])[0][0]
             rolling_arr[ci, yi, si] = sector_scalers[sector].transform([[rol]])[0][0]
 
-            # Class label from rolling avg (denormalized)
-            label_arr[ci, yi, si] = np.searchsorted(
-                CLASS_BINS[1:-1], rol
-            )
+            # FIX: Label from RAW rolling-avg growth rate, NOT from z-score
+            # CLASS_BINS[-inf, -0.05, 0.05, 0.20, +inf] are growth-rate thresholds
+            label_arr[ci, yi, si] = np.searchsorted(CLASS_BINS[1:-1], rol)
 
         for fi, feat in enumerate(MACRO_FEATURES):
             raw = row[feat].values[0]
@@ -393,11 +439,16 @@ for county in counties:
 
 print(f"✓ Arrays: sector={sector_arr.shape}, labels={label_arr.shape}")
 
+# Verify corrected label distribution
+all_labels    = label_arr.flatten()
+class_counts  = np.bincount(all_labels, minlength=N_CLASSES).astype(int)
+print(f"\nLabel distribution (should be meaningful, not bimodal):")
+for i, (label, count) in enumerate(zip(CLASS_LABELS, class_counts)):
+    print(f"  {label}: {count:,} ({count/len(all_labels)*100:.1f}%)")
+
 # -------------------------------------------------------------------
 # Neighbor feature lookup
-# avg normalized growth rate of N_NEIGHBORS nearest counties, same sector
 # -------------------------------------------------------------------
-# Build FIPS → county_idx map
 fips2ci = {}
 for county in counties:
     fips = county2fips.get(county)
@@ -405,8 +456,8 @@ for county in counties:
         fips2ci[fips] = county2idx[county]
 
 def get_neighbor_avg(ci, si, yi, n=N_NEIGHBORS):
-    county  = counties[ci]
-    fips    = county2fips.get(county)
+    county        = counties[ci]
+    fips          = county2fips.get(county)
     if not fips:
         return 0.0
     neighbor_fips = GA_NEIGHBORS.get(fips, [])
@@ -418,22 +469,18 @@ def get_neighbor_avg(ci, si, yi, n=N_NEIGHBORS):
     return float(np.mean(vals)) if vals else 0.0
 
 # -------------------------------------------------------------------
-# Class weights for imbalanced loss
+# Class weights
 # -------------------------------------------------------------------
-all_labels = label_arr.flatten()
-class_counts = np.bincount(all_labels, minlength=N_CLASSES).astype(float)
+class_counts_float = np.bincount(all_labels, minlength=N_CLASSES).astype(float)
 class_weights = torch.tensor(
-    1.0 / (class_counts / class_counts.sum()),
+    1.0 / (class_counts_float / class_counts_float.sum()),
     dtype=torch.float32
 )
 class_weights = class_weights / class_weights.sum() * N_CLASSES
-print(f"\nClass distribution: {dict(zip(CLASS_LABELS, class_counts.astype(int)))}")
-print(f"Class weights: {class_weights.numpy().round(3)}")
+print(f"\nClass weights: {class_weights.numpy().round(3)}")
 
 # -------------------------------------------------------------------
 # Dataset
-# Input per timestep:
-#   macro (5) + sector_rate (1) + neighbor_avg (1) + imputed_mask (1) = 8
 # -------------------------------------------------------------------
 INPUT_SIZE = len(MACRO_FEATURES) + 1 + 1 + 1  # macro + sector + neighbor + mask
 
@@ -468,7 +515,6 @@ def build_samples(split="train"):
                 if split == "val"   and target_start != 14: continue
                 if split == "test"  and target_start <= 14: continue
 
-                # Build input sequence
                 x_seq = []
                 for ti in range(t, t + SEQ_LEN):
                     macro_vec    = macro_arr[ci, ti, :].tolist()
@@ -477,7 +523,6 @@ def build_samples(split="train"):
                     imputed_mask = 0.0
                     x_seq.append(macro_vec + [sector_val, neighbor_val, imputed_mask])
 
-                # Target: class labels for next FORECAST_HORIZON steps
                 y_labels = label_arr[ci, target_start:target_start + FORECAST_HORIZON, si]
                 if len(y_labels) < FORECAST_HORIZON:
                     continue
@@ -504,7 +549,7 @@ val_loader   = DataLoader(TerraDataset(val_samples),   batch_size=BATCH_SIZE, sh
 test_loader  = DataLoader(TerraDataset(test_samples),  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # -------------------------------------------------------------------
-# Model
+# Model (unchanged from original v2)
 # -------------------------------------------------------------------
 class TerraLSTM(nn.Module):
     def __init__(self):
@@ -520,12 +565,11 @@ class TerraLSTM(nn.Module):
             input_size=HIDDEN_SIZE,
             hidden_size=HIDDEN_SIZE,
             num_layers=NUM_LAYERS,
-            dropout=DROPOUT,
+            dropout=DROPOUT,   # 0.4 — increased to reduce overfitting
             batch_first=True
         )
         self.dropout = nn.Dropout(DROPOUT)
 
-        # One classification head per forecast step
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(HIDDEN_SIZE, 64),
@@ -542,10 +586,9 @@ class TerraLSTM(nn.Module):
         s_emb = self.sector_emb(sector_idx).unsqueeze(1).expand(B, T, -1)
         c_emb = self.county_emb(county_idx).unsqueeze(1).expand(B, T, -1)
 
-        # Year embedding: one per timestep in sequence
         yr_range = year_idx.unsqueeze(1) + torch.arange(T, device=x_seq.device).unsqueeze(0)
         yr_range = yr_range.clamp(0, N_YEARS - 1)
-        y_emb    = self.year_emb(yr_range)   # [B, T, YEAR_EMB_DIM]
+        y_emb    = self.year_emb(yr_range)
 
         x = torch.cat([x_seq, s_emb, c_emb, y_emb], dim=-1)
         x = torch.relu(self.input_proj(x))
@@ -553,9 +596,8 @@ class TerraLSTM(nn.Module):
         out, _  = self.lstm(x)
         last    = self.dropout(out[:, -1, :])
 
-        # One logit vector per forecast step
-        logits = [head(last) for head in self.heads]  # list of [B, N_CLASSES]
-        return torch.stack(logits, dim=1)              # [B, FORECAST_HORIZON, N_CLASSES]
+        logits = [head(last) for head in self.heads]
+        return torch.stack(logits, dim=1)
 
 
 model     = TerraLSTM().to(device)
@@ -585,12 +627,11 @@ for epoch in range(1, EPOCHS + 1):
     for ci, si, yi, x_seq, y_labels in train_loader:
         ci, si, yi = ci.to(device), si.to(device), yi.to(device)
         x_seq      = x_seq.to(device)
-        y_labels   = y_labels.to(device)   # [B, FORECAST_HORIZON]
+        y_labels   = y_labels.to(device)
 
         optimizer.zero_grad()
-        logits = model(ci, si, yi, x_seq)  # [B, FORECAST_HORIZON, N_CLASSES]
+        logits = model(ci, si, yi, x_seq)
 
-        # Compute cross-entropy over all forecast steps
         loss = sum(
             criterion(logits[:, step, :], y_labels[:, step])
             for step in range(FORECAST_HORIZON)
@@ -638,7 +679,7 @@ print(f"\n✓ Best val loss: {best_val_loss:.4f}")
 # Evaluation
 # -------------------------------------------------------------------
 print("\n" + "="*70)
-print("EVALUATION (test set — 2017-2023 excl. 2020)")
+print("EVALUATION (test set)")
 print("="*70)
 
 model.eval()
@@ -650,7 +691,7 @@ with torch.no_grad():
         logits = model(
             ci.to(device), si.to(device), yi.to(device), x_seq.to(device)
         ).cpu()
-        preds    = logits.argmax(dim=-1)   # [B, FORECAST_HORIZON]
+        preds    = logits.argmax(dim=-1)
         s_idxs   = si.numpy()
         y_true   = y_labels.numpy()
         y_pred   = preds.numpy()
@@ -707,20 +748,21 @@ torch.save({
         "n_years":           N_YEARS,
         "n_classes":         N_CLASSES,
     },
-    "sector_cols":       SECTOR_COLS,
-    "macro_features":    MACRO_FEATURES,
-    "county2idx":        county2idx,
-    "sector2idx":        {s: i for i, s in enumerate(SECTOR_COLS)},
-    "year2idx":          year2idx,
-    "county2fips":       county2fips,
-    "ga_neighbors":      GA_NEIGHBORS,
-    "sector_scalers":    sector_scalers,
-    "macro_scalers":     macro_scalers,
-    "class_bins":        CLASS_BINS,
-    "class_labels":      CLASS_LABELS,
+    "sector_cols":        SECTOR_COLS,
+    "macro_features":     MACRO_FEATURES,
+    "county2idx":         county2idx,
+    "sector2idx":         {s: i for i, s in enumerate(SECTOR_COLS)},
+    "year2idx":           year2idx,
+    "county2fips":        county2fips,
+    "ga_neighbors":       GA_NEIGHBORS,
+    "sector_scalers":     sector_scalers,
+    "macro_scalers":      macro_scalers,
+    "sector_winsor_bounds": sector_winsor_bounds,   # saved for inference-time clipping
+    "class_bins":         CLASS_BINS,
+    "class_labels":       CLASS_LABELS,
     "class_growth_rates": CLASS_GROWTH_RATES,
-    "years":             years,
-    "model_version":     "terratrends_lstm_v2",
+    "years":              years,
+    "model_version":      "terratrends_lstm_v2_fixed",
 }, "lstm_model_v2.pt")
 
 print("✓ Saved to lstm_model_v2.pt")

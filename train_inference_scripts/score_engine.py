@@ -1,240 +1,336 @@
 """
-TERRATRENDS SCORE ENGINE
-========================
-Takes a CSV of businesses, outputs 1Y / 3Y / 5Y scores.
+TERRATRENDS SCORE ENGINE v2 (CORRECTED)
+========================================
+Given a business's details, scores all 159 Georgia counties and
+returns them ranked best-to-worst for expansion.
 
-Score(X) = (0.5 * P_survival(X) + 0.5 * revenue_score(X)) * 100
+Changes vs original:
+  1. Passes county population to forecast_multiple_horizons() so the
+     forecaster can apply small-county confidence dampening. Counties
+     under 40k pop have class probabilities pulled toward uniform to
+     prevent single-establishment noise from producing extreme scores.
+  2. Population column added to output CSV for transparency.
+  3. No other interface changes.
 
-Where:
-  P_survival(X)    = adjusted survival probability at horizon X
-                     (BLS base rate, adjusted for age, size, county economic outlook)
-  revenue_score(X) = sigmoid of compounded sector growth rate
-                     (how much the sector is expected to grow in this county)
-
-Revenue projection:
-  projected_revenue = current_revenue * compound_multiplier
-  where compound_multiplier = product of (1 + predicted_annual_growth_rate)
-  for each year from 2025 to the target year.
-
-Input CSV columns (required):
-  - business_name   : str
-  - county          : str   must match county names in merged_data.csv (e.g. "Fulton, GA")
-  - sector          : str   must match sector_columns (e.g. "Health care and social assistance")
-  - current_revenue : float (USD)
-  - employee_count  : int
-
-Input CSV columns (optional):
-  - founding_year   : int   used for age-based survival adjustment
-
-Output CSV adds:
-  - score_1y, score_3y, score_5y
-  - survival_1y, survival_3y, survival_5y
-  - revenue_score_1y, revenue_score_3y, revenue_score_5y
-  - projected_revenue_1y, projected_revenue_3y, projected_revenue_5y
-  - sector_growth_1y, sector_growth_3y, sector_growth_5y  (net %, e.g. 18.4)
-  - status, notes
+Flow:
+  1. User inputs: sector, revenue, employee_count, founding_year
+  2. For each of 159 counties:
+       - Run LSTM forecast for that county + sector (with pop dampening)
+       - Compute survival probability (adjusted for county outlook)
+       - Compute revenue score from projected growth
+       - Score = (0.5 * P_survival + 0.5 * revenue_score) * 100
+  3. Return all 159 counties ranked by score
 
 Usage:
-  python score_engine.py --input businesses.csv --output scores.csv
-  python score_engine.py --input businesses.csv --output scores.csv --data data/merged_data.csv --model trained_model.pkl
+  python score_engine.py --sector "Health care and social assistance" \
+                         --revenue 500000 \
+                         --employees 8 \
+                         --founding-year 2015 \
+                         --horizon 3y \
+                         --output results.csv
+
+  python score_engine.py --input business.csv --output results.csv
+  (CSV must have: sector, current_revenue, employee_count, founding_year)
 """
 
 import argparse
 import pandas as pd
 import numpy as np
 import warnings
+import sys
 warnings.filterwarnings("ignore")
 
 from survival_base_rates import compute_survival_probability
 from lstm_forecaster import forecast_multiple_horizons
 
-CURRENT_YEAR     = 2025
-BASE_DATA_YEAR   = 2023
-HORIZONS         = ["1y", "3y", "5y"]
-REQUIRED_COLUMNS = ["business_name", "county", "sector", "current_revenue", "employee_count"]
+CURRENT_YEAR   = 2025
+BASE_DATA_YEAR = 2023
+HORIZONS       = ["1y", "3y", "5y"]
+
+# Population dampening threshold (passed to forecaster).
+# Counties below this have class probabilities pulled toward uniform.
+POP_DAMPEN_THRESHOLD = 40_000
 
 
-def _revenue_growth_to_score(total_growth: float) -> float:
+def _get_county_pop(county: str, econ_data: pd.DataFrame) -> float:
+    """Return the most recent non-null population for a county."""
+    rows = econ_data[econ_data["County"] == county]["TOT_POP"].dropna()
+    return float(rows.iloc[-1]) if len(rows) > 0 else None
+
+
+def score_all_counties(
+    sector: str,
+    current_revenue: float,
+    employee_count: int,
+    founding_year: int,
+    econ_data: pd.DataFrame,
+    model_path: str = "lstm_model_v2.pt",
+    horizon: str = "3y"
+) -> pd.DataFrame:
     """
-    Map compounded net growth (decimal) to [0, 1] via sigmoid.
-    0% growth  → 0.50
-    +20% total → ~0.69
-    +50% total → ~0.85
-    -20% total → ~0.31
+    Score all 159 Georgia counties for a given business profile.
+
+    Parameters
+    ----------
+    sector          : str   — must match sector column names exactly
+    current_revenue : float — current annual revenue in USD
+    employee_count  : int
+    founding_year   : int
+    econ_data       : pd.DataFrame — merged_data.csv
+    model_path      : str
+    horizon         : str   — '1y', '3y', or '5y'
+
+    Returns
+    -------
+    pd.DataFrame ranked by score descending, with all 159 counties
     """
-    return float(1 / (1 + np.exp(-4 * total_growth)))
+    business_age = max(0, CURRENT_YEAR - founding_year)
+    counties     = sorted(econ_data["County"].unique())
+    results      = []
+
+    print(f"\nScoring {len(counties)} counties for '{sector}' ({horizon} horizon)...")
+    print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
+    print("-" * 60)
+
+    errors = 0
+    for i, county in enumerate(counties, 1):
+        if i % 20 == 0 or i == len(counties):
+            print(f"  {i}/{len(counties)} counties scored...", end="\r")
+
+        try:
+            # Look up population for small-county dampening
+            county_pop = _get_county_pop(county, econ_data)
+
+            forecasts = forecast_multiple_horizons(
+                county=county,
+                sector=sector,
+                df=econ_data,
+                base_year=BASE_DATA_YEAR,
+                model_path=model_path,
+                county_pop=county_pop,       # NEW: enables population dampening
+            )
+
+            fc = forecasts.get(horizon)
+            if fc is None:
+                raise ValueError(f"No forecast returned for horizon {horizon}")
+
+            p_survival = compute_survival_probability(
+                sector=sector,
+                business_age_years=business_age,
+                employee_count=employee_count,
+                economic_adjustment=fc["economic_adjustment"],
+                horizon=horizon
+            )
+
+            revenue_score = fc["revenue_score"]
+            total_growth  = fc["total_growth"]
+            score         = (0.5 * p_survival + 0.5 * revenue_score) * 100
+
+            projected_revenue = round(current_revenue * fc["compound_multiplier"], 2) \
+                                if current_revenue > 0 else np.nan
+
+            class_probs = fc.get("class_probs", [None] * 4)
+
+            results.append({
+                "rank":                None,
+                "county":              county,
+                "population":          int(county_pop) if county_pop else None,
+                "score":               round(score, 2),
+                f"score_{horizon}":    round(score, 2),
+                "survival_prob":       round(p_survival, 4),
+                "revenue_score":       round(revenue_score, 4),
+                "projected_revenue":   projected_revenue,
+                "sector_growth_pct":   round(total_growth * 100, 2),
+                "annual_growth_rate":  round(fc["annual_growth_rate"] * 100, 2),
+                "economic_adjustment": round(fc["economic_adjustment"], 3),
+                "p_shrinking":         round(class_probs[0], 3) if class_probs[0] is not None else None,
+                "p_flat":              round(class_probs[1], 3) if class_probs[1] is not None else None,
+                "p_moderate":          round(class_probs[2], 3) if class_probs[2] is not None else None,
+                "p_strong":            round(class_probs[3], 3) if class_probs[3] is not None else None,
+                "status":              "ok",
+                "notes":               f"pop_dampened" if county_pop and county_pop < POP_DAMPEN_THRESHOLD else "",
+            })
+
+        except Exception as e:
+            errors += 1
+            results.append({
+                "rank":               None,
+                "county":             county,
+                "population":         None,
+                "score":              np.nan,
+                f"score_{horizon}":   np.nan,
+                "survival_prob":      np.nan,
+                "revenue_score":      np.nan,
+                "projected_revenue":  np.nan,
+                "sector_growth_pct":  np.nan,
+                "annual_growth_rate": np.nan,
+                "economic_adjustment": np.nan,
+                "p_shrinking":        None,
+                "p_flat":             None,
+                "p_moderate":         None,
+                "p_strong":           None,
+                "status":             "error",
+                "notes":              str(e),
+            })
+
+    print(f"\n✓ Scored {len(results) - errors}/159 counties ({errors} errors)")
+
+    df_out = pd.DataFrame(results)
+    df_out = df_out.sort_values("score", ascending=False).reset_index(drop=True)
+    df_out["rank"] = df_out.index + 1
+
+    cols = ["rank", "county", "population", "score", "survival_prob", "revenue_score",
+            "projected_revenue", "sector_growth_pct", "annual_growth_rate",
+            "economic_adjustment", "p_shrinking", "p_flat", "p_moderate", "p_strong",
+            "status", "notes"]
+    df_out = df_out[[c for c in cols if c in df_out.columns]]
+
+    return df_out
 
 
-def _validate_input(df: pd.DataFrame):
-    warnings_out = []
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input CSV missing required columns: {missing}")
+def print_summary(df: pd.DataFrame, sector: str, horizon: str, top_n: int = 10):
+    print(f"\n{'='*60}")
+    print(f"  TOP {top_n} COUNTIES — {sector[:40]}")
+    print(f"  Horizon: {horizon.upper()}")
+    print(f"{'='*60}")
+    print(f"  {'Rank':<5} {'County':<25} {'Score':>6}  {'Survival':>8}  {'Growth':>7}  {'Pop':>10}")
+    print(f"  {'-'*63}")
+    for _, row in df.head(top_n).iterrows():
+        pop_str = f"{int(row['population']):,}" if pd.notna(row.get('population')) else "N/A"
+        print(f"  {int(row['rank']):<5} {row['county']:<25} {row['score']:>6.1f}  "
+              f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  {pop_str:>10}")
 
-    df = df.copy()
-    df["current_revenue"] = pd.to_numeric(df["current_revenue"], errors="coerce")
-    df["employee_count"]  = pd.to_numeric(df["employee_count"],  errors="coerce").fillna(5).astype(int)
-
-    if "founding_year" in df.columns:
-        df["founding_year"] = pd.to_numeric(df["founding_year"], errors="coerce")
-    else:
-        df["founding_year"] = np.nan
-        warnings_out.append("founding_year not provided — business age defaulted to 5 years")
-
-    null_rev = df["current_revenue"].isna().sum()
-    if null_rev > 0:
-        warnings_out.append(f"{null_rev} rows have missing current_revenue — projected_revenue will be blank")
-
-    return df, warnings_out
-
-
-def score_business(row: pd.Series, econ_data: pd.DataFrame, model_path: str) -> dict:
-    """Score a single business across 1Y / 3Y / 5Y horizons."""
-
-    result = {
-        "business_name": row["business_name"],
-        "county":        row["county"],
-        "sector":        row["sector"],
-        "status":        "ok",
-        "notes":         "",
-    }
-    notes = []
-
-    # Business age
-    if pd.notna(row.get("founding_year")):
-        business_age = max(0, CURRENT_YEAR - int(row["founding_year"]))
-    else:
-        business_age = 5
-        notes.append("age defaulted to 5yr")
-
-    employee_count  = int(row.get("employee_count", 5))
-    current_revenue = row.get("current_revenue")
-
-    # Get economic forecasts for all horizons
-    try:
-        forecasts = forecast_multiple_horizons(
-            county=row["county"],
-            sector=row["sector"],
-            df=econ_data,
-            base_year=BASE_DATA_YEAR,
-            model_path=model_path
-        )
-    except Exception as e:
-        result["status"] = "error"
-        result["notes"]  = f"Forecast failed: {e}"
-        for h in HORIZONS:
-            for col in ["score", "survival", "revenue_score", "projected_revenue", "sector_growth"]:
-                result[f"{col}_{h}"] = np.nan
-        return result
-
-    for h in HORIZONS:
-        fc = forecasts.get(h)
-
-        if fc is None:
-            notes.append(f"no forecast for {h}")
-            for col in ["score", "survival", "revenue_score", "projected_revenue", "sector_growth"]:
-                result[f"{col}_{h}"] = np.nan
-            continue
-
-        # Survival probability — adjusted by economic outlook and firm characteristics
-        p_survival = compute_survival_probability(
-            sector=row["sector"],
-            business_age_years=business_age,
-            employee_count=employee_count,
-            economic_adjustment=fc["economic_adjustment"],
-            horizon=h
-        )
-
-        # Revenue score — sigmoid of compounded net sector growth
-        total_growth  = fc["total_growth"]          # e.g. 0.18 = +18% total
-        revenue_score = _revenue_growth_to_score(total_growth)
-
-        # Projected revenue — current revenue × compound multiplier
-        compound = fc["compound_multiplier"]        # e.g. 1.18
-        if pd.notna(current_revenue) and current_revenue > 0:
-            projected_revenue = round(current_revenue * compound, 2)
-        else:
-            projected_revenue = np.nan
-
-        score = (0.5 * p_survival + 0.5 * revenue_score) * 100
-
-        result[f"score_{h}"]             = round(score, 2)
-        result[f"survival_{h}"]          = round(p_survival, 4)
-        result[f"revenue_score_{h}"]     = round(revenue_score, 4)
-        result[f"projected_revenue_{h}"] = projected_revenue
-        result[f"sector_growth_{h}"]     = round(total_growth * 100, 2)   # as percent
-
-    result["notes"] = "; ".join(notes) if notes else ""
-    return result
+    print(f"\n  BOTTOM 5:")
+    print(f"  {'-'*63}")
+    for _, row in df.tail(5).iterrows():
+        if row["status"] == "ok":
+            pop_str = f"{int(row['population']):,}" if pd.notna(row.get('population')) else "N/A"
+            print(f"  {int(row['rank']):<5} {row['county']:<25} {row['score']:>6.1f}  "
+                  f"{row['survival_prob']:>8.3f}  {row['sector_growth_pct']:>6.1f}%  {pop_str:>10}")
+    print()
 
 
-def run(input_path: str, output_path: str, data_path: str, model_path: str):
+def run_single(
+    sector: str,
+    current_revenue: float,
+    employee_count: int,
+    founding_year: int,
+    output_path: str,
+    data_path: str,
+    model_path: str,
+    horizon: str = "3y"
+):
+    print("\n" + "="*60)
+    print("  TERRATRENDS — COUNTY EXPANSION RANKER")
+    print("="*60)
 
-    print("\n" + "="*70)
-    print("  TERRATRENDS SCORE ENGINE")
-    print("="*70)
-
-    print(f"\nLoading business data:  {input_path}")
-    input_df, input_warnings = _validate_input(pd.read_csv(input_path))
-    print(f"✓ {len(input_df)} businesses loaded")
-    for w in input_warnings:
-        print(f"  ⚠ {w}")
-
-    print(f"\nLoading economic data:  {data_path}")
     econ_data = pd.read_csv(data_path).sort_values(["County", "Year"])
-    print(f"✓ {len(econ_data)} rows, {econ_data['County'].nunique()} counties")
+    print(f"✓ Loaded {econ_data['County'].nunique()} counties")
 
-    missing_counties = set(input_df["county"].unique()) - set(econ_data["County"].unique())
-    if missing_counties:
-        print(f"\n  ⚠ Counties not found in economic data: {missing_counties}")
+    ranked = score_all_counties(
+        sector=sector,
+        current_revenue=current_revenue,
+        employee_count=employee_count,
+        founding_year=founding_year,
+        econ_data=econ_data,
+        model_path=model_path,
+        horizon=horizon
+    )
 
-    print(f"\nScoring across 1Y / 3Y / 5Y horizons...")
-    print("-"*70)
+    print_summary(ranked, sector, horizon)
 
-    results = []
-    for i, (_, row) in enumerate(input_df.iterrows(), 1):
-        if i % 10 == 0 or i == len(input_df):
-            print(f"  {i}/{len(input_df)}", end="\r")
-        results.append(score_business(row, econ_data, model_path))
+    ranked.to_csv(output_path, index=False)
+    print(f"✓ Full rankings saved to: {output_path}")
+    print("="*60 + "\n")
 
-    print(f"\n✓ Done")
-
-    results_df = pd.DataFrame(results)
-
-    # Merge with input, scores first
-    output_df = pd.concat([
-        input_df.reset_index(drop=True),
-        results_df.drop(columns=["business_name", "county", "sector"], errors="ignore").reset_index(drop=True)
-    ], axis=1)
-
-    id_cols    = ["business_name", "county", "sector", "current_revenue", "employee_count"]
-    score_cols = [c for c in output_df.columns if c.startswith("score_")]
-    other_cols = [c for c in output_df.columns if c not in id_cols + score_cols]
-    output_df  = output_df[id_cols + score_cols + other_cols]
-
-    output_df.to_csv(output_path, index=False)
-
-    # Summary
-    ok_count  = (results_df["status"] == "ok").sum()
-    err_count = (results_df["status"] == "error").sum()
-
-    print(f"\n{'='*70}")
-    print(f"  RESULTS SUMMARY")
-    print(f"{'='*70}")
-    print(f"  Scored: {ok_count}   Errors: {err_count}")
-
-    print(f"\n✓ Output saved to: {output_path}")
-    print("="*70 + "\n")
-
-    return output_df
+    return ranked
 
 
+def run_batch(
+    input_path: str,
+    output_dir: str,
+    data_path: str,
+    model_path: str,
+    horizon: str = "3y"
+):
+    """
+    Batch mode: read multiple businesses from CSV, output one
+    ranked CSV per business into output_dir.
+
+    Input CSV columns: business_name, sector, current_revenue,
+                       employee_count, founding_year
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    businesses = pd.read_csv(input_path)
+    econ_data  = pd.read_csv(data_path).sort_values(["County", "Year"])
+
+    print(f"\n{'='*60}")
+    print(f"  BATCH MODE — {len(businesses)} businesses")
+    print(f"{'='*60}\n")
+
+    for _, biz in businesses.iterrows():
+        name = biz.get("business_name", f"business_{_}")
+        print(f"\n>>> {name}")
+
+        ranked = score_all_counties(
+            sector=str(biz["sector"]),
+            current_revenue=float(biz.get("current_revenue", 0)),
+            employee_count=int(biz.get("employee_count", 5)),
+            founding_year=int(biz.get("founding_year", CURRENT_YEAR - 5)),
+            econ_data=econ_data,
+            model_path=model_path,
+            horizon=horizon
+        )
+
+        safe_name = "".join(c if c.isalnum() else "_" for c in name)
+        out_path  = os.path.join(output_dir, f"{safe_name}_rankings.csv")
+        ranked.to_csv(out_path, index=False)
+
+        print_summary(ranked, str(biz["sector"]), horizon, top_n=5)
+        print(f"  Saved: {out_path}")
+
+
+# -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TerraTraends Business Score Engine")
-    parser.add_argument("--input",  required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--data",   default="data/merged_data.csv")
-    parser.add_argument("--model",  default="lstm_model_v2.pt")
+    parser = argparse.ArgumentParser(description="TerraTraends County Expansion Ranker")
+
+    parser.add_argument("--sector",        type=str,   help="Business sector")
+    parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
+    parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
+    parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
+    parser.add_argument("--horizon",       type=str,   default="3y",   choices=["1y","3y","5y"])
+
+    parser.add_argument("--input",      type=str, help="Batch input CSV")
+    parser.add_argument("--output-dir", type=str, default="rankings/", help="Output dir for batch")
+
+    parser.add_argument("--output", type=str, default="county_rankings.csv")
+    parser.add_argument("--data",   type=str, default="data/merged_data.csv")
+    parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
+
     args = parser.parse_args()
 
-    run(args.input, args.output, args.data, args.model)
+    if args.input:
+        run_batch(args.input, args.output_dir, args.data, args.model, args.horizon)
+    elif args.sector:
+        run_single(
+            sector=args.sector,
+            current_revenue=args.revenue,
+            employee_count=args.employees,
+            founding_year=args.founding_year,
+            output_path=args.output,
+            data_path=args.data,
+            model_path=args.model,
+            horizon=args.horizon
+        )
+    else:
+        print("Provide either --sector (single mode) or --input (batch mode)")
+        print()
+        print("Example:")
+        print('  python score_engine.py --sector "Health care and social assistance" \\')
+        print('                         --revenue 500000 --employees 8 \\')
+        print('                         --founding-year 2015 --horizon 3y')
+        sys.exit(1)
