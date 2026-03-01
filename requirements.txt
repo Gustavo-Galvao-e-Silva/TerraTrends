@@ -8,3 +8,5 @@ torch
 requests
 tqdm
 pyarrow
+fastapi[standard]
+uvicorn

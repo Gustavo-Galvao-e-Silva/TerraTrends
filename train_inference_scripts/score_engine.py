@@ -23,7 +23,6 @@ def _get_county_pop(county: str, econ_data: pd.DataFrame) -> float:
     rows = econ_data[econ_data["County"] == county]["TOT_POP"].dropna()
     return float(rows.iloc[-1]) if len(rows) > 0 else None
 
-
 def score_all_counties(
     sector: str,
     current_revenue: float,
@@ -62,10 +61,14 @@ def score_all_counties(
     print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
     print("-" * 60)
 
+    county_to_geoid = (econ_data[["County", "GeoID"]].drop_duplicates().set_index("County")["GeoID"])
+    unique_geoids = sorted(econ_data["GeoID"].unique())
+    geoid_to_index = {g: i+1 for i, g in enumerate(unique_geoids)}
+
     errors = 0
     for i, county in enumerate(counties, 1):
-        if i % 20 == 0 or i == len(counties):
-            print(f"  {i}/{len(counties)} counties scored...", end="\r")
+        geo_id = county_to_geoid[county]
+        id = geoid_to_index[geo_id]
 
         try:
             county_pop = _get_county_pop(county, econ_data)
@@ -109,6 +112,7 @@ def score_all_counties(
 
             results.append({
                 "rank":                None,
+                "id" :                 id,
                 "county":              county,
                 "population":          int(county_pop) if county_pop else None,
                 "score":               None,          # filled after normalization
@@ -132,6 +136,7 @@ def score_all_counties(
             errors += 1
             results.append({
                 "rank":               None,
+                "id" :                id,
                 "county":             county,
                 "population":         None,
                 "score":              np.nan,
@@ -150,7 +155,7 @@ def score_all_counties(
                 "notes":              str(e),
             })
 
-    print(f"\n✓ Scored {len(results) - errors}/159 counties ({errors} errors)")
+    print(f"\nScored {len(results) - errors}/159 counties ({errors} errors)")
 
     df_out = pd.DataFrame(results)
 
@@ -185,7 +190,7 @@ def score_all_counties(
     df_out = df_out.sort_values("score", ascending=False).reset_index(drop=True)
     df_out["rank"] = df_out.index + 1
 
-    cols = ["rank", "county", "population", "score", "tier", "survival_prob", "revenue_score",
+    cols = ["rank", "id", "county", "population", "score", "tier", "survival_prob", "revenue_score",
             "projected_revenue", "sector_growth_pct", "annual_growth_rate",
             "economic_adjustment", "p_shrinking", "p_flat", "p_moderate", "p_strong",
             "status", "notes"]
@@ -218,21 +223,9 @@ def print_summary(df: pd.DataFrame, sector: str, horizon: str, top_n: int = 10):
     print()
 
 
-def predict(
-    sector: str,
-    current_revenue: float,
-    employee_count: int,
-    founding_year: int,
-    data_path: str,
-    model_path: str,
-    horizon: str = "3y"
-):
-    print("\n" + "="*60)
-    print("Ranked county expansion")
-    print("="*60)
-
+def predict(sector: str, current_revenue: float, employee_count: int, founding_year: int, data_path: str, model_path: str, horizon: str = "3y"):
     econ_data = pd.read_csv(data_path).sort_values(["County", "Year"])
-    print(f"✓ Loaded {econ_data['County'].nunique()} counties")
+    print(f"Loaded {econ_data['County'].nunique()} counties")
 
     ranked = score_all_counties(
         sector=sector,
@@ -244,40 +237,42 @@ def predict(
         horizon=horizon
     )
 
+    ranked = ranked.replace({np.nan: None})
     print_summary(ranked, sector, horizon)
-    return ranked
+    return ranked.to_dict(orient="records")
 
-# CLi
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TerraTrends County Expansion Ranker")
 
-    parser.add_argument("--sector",        type=str,   help="Business sector")
-    parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
-    parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
-    parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
-    parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
+# # CLi
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="TerraTrends County Expansion Ranker")
 
-    parser.add_argument("--input",      type=str, help="Batch input CSV")
-    parser.add_argument("--data",   type=str, default="data/merged_data_v2.csv")
-    parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
+#     parser.add_argument("--sector",        type=str,   help="Business sector")
+#     parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
+#     parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
+#     parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
+#     parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
 
-    args = parser.parse_args()
+#     parser.add_argument("--input",      type=str, help="Batch input CSV")
+#     parser.add_argument("--data",   type=str, default="data/merged_data_v2.csv")
+#     parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
 
-    if args.sector:
-        predict(
-            sector=args.sector,
-            current_revenue=args.revenue,
-            employee_count=args.employees,
-            founding_year=args.founding_year,
-            data_path=args.data,
-            model_path=args.model,
-            horizon=args.horizon
-        )
-    else:
-        print("Provide either --sector (single mode) or --input (batch mode)")
-        print()
-        print("Example:")
-        print('  python score_engine.py --sector "Health care and social assistance" \\')
-        print('                         --revenue 500000 --employees 8 \\')
-        print('                         --founding-year 2015 --horizon 3y')
-        sys.exit(1)
+#     args = parser.parse_args()
+
+#     if args.sector:
+#         predict(
+#             sector=args.sector,
+#             current_revenue=args.revenue,
+#             employee_count=args.employees,
+#             founding_year=args.founding_year,
+#             data_path=args.data,
+#             model_path=args.model,
+#             horizon=args.horizon
+#         )
+#     else:
+#         print("Provide either --sector (single mode) or --input (batch mode)")
+#         print()
+#         print("Example:")
+#         print('  python score_engine.py --sector "Health care and social assistance" \\')
+#         print('                         --revenue 500000 --employees 8 \\')
+#         print('                         --founding-year 2015 --horizon 3y')
+#         sys.exit(1)
