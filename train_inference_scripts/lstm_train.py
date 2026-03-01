@@ -30,9 +30,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import warnings
 warnings.filterwarnings("ignore")
 
-# -------------------------------------------------------------------
 # Config
-# -------------------------------------------------------------------
 SEED             = 42
 SEQ_LEN          = 10
 FORECAST_HORIZON = 3
@@ -40,9 +38,9 @@ N_CLASSES        = 4
 BATCH_SIZE       = 512
 EPOCHS           = 150
 LR               = 3e-4
-HIDDEN_SIZE      = 64    # reduced from 128 to cut overfitting (train/val gap was 0.53/0.87)
+HIDDEN_SIZE      = 64   
 NUM_LAYERS       = 2
-DROPOUT          = 0.4  # increased from 0.3 for same reason
+DROPOUT          = 0.4
 SECTOR_EMB_DIM   = 8
 COUNTY_EMB_DIM   = 16
 YEAR_EMB_DIM     = 4
@@ -55,7 +53,7 @@ CLASS_LABELS = ["shrinking", "flat", "moderate", "strong"]
 
 
 CLASS_GROWTH_RATES = {
-    0: -0.05,   # shrinking sector contribution → business ~-5%/yr
+    0: -0.05,   # shrinking sector growth → business ~-5%/yr
     1:  0.02,   # flat sector → business ~+2%/yr (roughly inflation)
     2:  0.06,   # moderate sector growth → business ~+6%/yr
     3:  0.12,   # strong sector growth → business ~+12%/yr
@@ -380,19 +378,13 @@ for feat in MACRO_FEATURES:
         df_imp.loc[mask, feat] = df_imp.loc[mask, feat].ffill().bfill()
     df_imp[feat] = df_imp[feat].fillna(df_imp[feat].mean())
 
-# -------------------------------------------------------------------
+
 # Build arrays
 # sector_arr    [N_COUNTIES, N_YEARS, N_SECTORS] — normalized raw growth rates
 # rolling_arr   [N_COUNTIES, N_YEARS, N_SECTORS] — normalized 3yr rolling avg
 # macro_arr     [N_COUNTIES, N_YEARS, N_MACRO]
 # label_arr     [N_COUNTIES, N_YEARS, N_SECTORS] — class labels 0-3
 #
-# FIX 2: Labels are computed from the RAW rolling-avg growth rate BEFORE
-#         normalization. The scaler is only applied to produce input features.
-#         This is the primary bug fix — previously z-scores were being binned
-#         with growth-rate thresholds, producing meaningless labels.
-# -------------------------------------------------------------------
-print("Building arrays...")
 sector_arr  = np.zeros((N_COUNTIES, N_YEARS, N_SECTORS), dtype=np.float32)
 rolling_arr = np.zeros((N_COUNTIES, N_YEARS, N_SECTORS), dtype=np.float32)
 macro_arr   = np.zeros((N_COUNTIES, N_YEARS, len(MACRO_FEATURES)), dtype=np.float32)
@@ -418,7 +410,6 @@ for county in counties:
             sector_arr[ci, yi, si]  = sector_scalers[sector].transform([[raw]])[0][0]
             rolling_arr[ci, yi, si] = sector_scalers[sector].transform([[rol]])[0][0]
 
-            # FIX: Label from RAW rolling-avg growth rate, NOT from z-score
             # CLASS_BINS[-inf, -0.05, 0.05, 0.20, +inf] are growth-rate thresholds
             label_arr[ci, yi, si] = np.searchsorted(CLASS_BINS[1:-1], rol)
 
@@ -479,7 +470,6 @@ print(f"✓ QCEW array built: {qcew_arr.shape}")
 # Verify corrected label distribution
 all_labels    = label_arr.flatten()
 class_counts  = np.bincount(all_labels, minlength=N_CLASSES).astype(int)
-print(f"\nLabel distribution (should be meaningful, not bimodal):")
 for i, (label, count) in enumerate(zip(CLASS_LABELS, class_counts)):
     print(f"  {label}: {count:,} ({count/len(all_labels)*100:.1f}%)")
 
@@ -505,9 +495,7 @@ def get_neighbor_avg(ci, si, yi, n=N_NEIGHBORS):
             vals.append(sector_arr[nci, yi, si])
     return float(np.mean(vals)) if vals else 0.0
 
-# -------------------------------------------------------------------
-# Class weights
-# -------------------------------------------------------------------
+# class weights
 class_counts_float = np.bincount(all_labels, minlength=N_CLASSES).astype(float)
 class_weights = torch.tensor(
     1.0 / (class_counts_float / class_counts_float.sum()),
@@ -516,9 +504,7 @@ class_weights = torch.tensor(
 class_weights = class_weights / class_weights.sum() * N_CLASSES
 print(f"\nClass weights: {class_weights.numpy().round(3)}")
 
-# -------------------------------------------------------------------
 # Dataset
-# -------------------------------------------------------------------
 INPUT_SIZE = len(MACRO_FEATURES) + 1 + 1 + 1 + 2  # macro + sector + neighbor + mask + qcew(emp,wage)
 
 class TerraDataset(Dataset):
@@ -579,7 +565,7 @@ def build_samples(split="train"):
     return samples
 
 
-print("\nBuilding datasets (this takes ~1 min due to neighbor lookups)...")
+print("\nBuilding datasets")
 train_samples = build_samples("train")
 val_samples   = build_samples("val")
 test_samples  = build_samples("test")
@@ -655,9 +641,7 @@ criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
 total_params = sum(p.numel() for p in model.parameters())
 print(f"\n✓ Model: {total_params:,} parameters")
 
-# -------------------------------------------------------------------
 # Training
-# -------------------------------------------------------------------
 print("\n" + "="*70)
 print("TRAINING")
 print("="*70)
@@ -722,9 +706,7 @@ for epoch in range(1, EPOCHS + 1):
 model.load_state_dict(best_state)
 print(f"\nBest val loss: {best_val_loss:.4f}")
 
-# -------------------------------------------------------------------
 # Evaluation
-# -------------------------------------------------------------------
 print("\n" + "="*70)
 print("Evaluation)")
 print("="*70)
@@ -770,9 +752,7 @@ print(f"\n  Confusion matrix (all sectors):")
 print(confusion_matrix(all_true, all_pred))
 print(f"  Classes: {CLASS_LABELS}")
 
-# -------------------------------------------------------------------
-# Binary evaluation: Growing (moderate+strong) vs Not-Growing
-# -------------------------------------------------------------------
+# Binary eval (growing vs. not growing)
 from sklearn.metrics import roc_auc_score
 
 y_true_arr = np.array(all_true)
