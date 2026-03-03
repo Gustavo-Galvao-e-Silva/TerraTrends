@@ -4,3 +4,9 @@ matplotlib
 scipy
 numpy
 scikit-learn
+torch
+requests
+tqdm
+pyarrow
+fastapi[standard]
+uvicorn

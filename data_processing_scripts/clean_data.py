@@ -2,13 +2,13 @@ import pandas as pd
 import numpy as np
 
 # Read the data
-df = pd.read_csv('data/input/merged_data.csv')
+df = pd.read_csv('./data/merged_data.csv')
 
 print(f"Original shape: {df.shape}")
 print(f"Original columns: {len(df.columns)}")
 
 # Keep geographic demographic columns
-geo_demo_cols = ['GeoID', 'County', 'Year', 'TOT_POP', 'TOT_MALE', 'TOT_FEMALE', 
+geo_demo_cols = ['GeoID', 'County', 'Year', 'TOT_POP',
                  'Unemployment_Rate', 'Per_Capita_Personal_Income', 'Real_GDP', 
                  'Percent_Change_Real_GDP', 'Bachelor_Degree_or_Higher_Pct']
 
@@ -74,6 +74,6 @@ for col in industry_cols_remaining:
     print(f"  - {col}")
 
 # Save cleaned data
-output_path = 'data/input/merged_data.csv'
+output_path = 'data/merged_data.csv'
 df_cleaned.to_csv(output_path, index=False)
 print(f"\nCleaned data saved to: {output_path}")

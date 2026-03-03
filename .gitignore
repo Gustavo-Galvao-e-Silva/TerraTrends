@@ -1,19 +1,17 @@
-# Data
-data/
-
 # macOS
 .DS_Store
 
 # Python
 __pycache__/
 *.pyc
-venv/
+venv
 .env
 
 # ML artifacts
 *.pkl
 *.pt
 *.pth
+rankings/
 
 # IDE
 .idea/
