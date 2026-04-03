@@ -170,17 +170,14 @@ def score_all_counties(
     ).round(2)
     df_out[f"score_{horizon}"] = df_out["score"]
 
-    # Tier labels based on survival and growth
+    # Tier labels based on expected value 
     def _tier(row):
-        if row["status"] != "ok":
-            return "N/A"
-        surv   = row["survival_prob"]
-        growth = row["sector_growth_pct"]
-        if surv >= 0.62 and growth >= 15:
+        ev = row["expected_val"]
+        if ev >= 0.9:
             return "Strong Expand"
-        elif surv >= 0.58 or growth >= 10:
+        elif ev >= 0.7:
             return "Cautious Expand"
-        elif surv >= 0.50 and growth >= 0:
+        elif ev >= 0.5:
             return "Watch"
         else:
             return "Avoid"
