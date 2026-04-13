@@ -1,6 +1,5 @@
 """
-LSTM FORECASTER v2 (CORRECTED)
-================================
+LSTM FORECASTER
 Matches the corrected lstm_trainer_v2.py.
 
 Changes vs original:
