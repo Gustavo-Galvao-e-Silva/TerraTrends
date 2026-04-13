@@ -1,5 +1,5 @@
 # Score engine
-# Runs inference on 
+# Runs inference using pre-computed static LSTM forecasts
 
 import argparse
 import pandas as pd
@@ -9,7 +9,6 @@ import sys
 warnings.filterwarnings("ignore")
 
 from survival_base_rates import compute_survival_probability, init_survival_model
-from lstm_forecaster import forecast_multiple_horizons
 
 CURRENT_YEAR   = 2025
 BASE_DATA_YEAR = 2023
@@ -23,13 +22,20 @@ def _get_county_pop(county: str, econ_data: pd.DataFrame) -> float:
     rows = econ_data[econ_data["County"] == county]["TOT_POP"].dropna()
     return float(rows.iloc[-1]) if len(rows) > 0 else None
 
+def _load_static_forecasts(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df = df[df["status"] == "ok"]
+    df = df.set_index(["county", "sector", "horizon"])
+    return df
+
+
 def score_all_counties(
     sector: str,
     current_revenue: float,
     employee_count: int,
     founding_year: int,
     econ_data: pd.DataFrame,
-    model_path: str = "lstm_model_v2.pt",
+    static_forecasts_path:  str,
     horizon: str = "3y",
     qcew_path: str = "data/qcew_long.csv",
 ) -> pd.DataFrame:
@@ -38,25 +44,26 @@ def score_all_counties(
 
     Parameters
     ----------
-    sector          : str   — must match sector column names exactly
-    current_revenue : float — current annual revenue in USD
-    employee_count  : int
-    founding_year   : int
-    econ_data       : pd.DataFrame — merged_data.csv
-    model_path      : str
-    horizon         : str   — '1y', '3y', or '5y'
-    qcew_path       : str   — path to qcew_long.csv
+    sector                : str   — must match sector column names exactly
+    current_revenue       : float — current annual revenue in USD
+    employee_count        : int
+    founding_year         : int
+    econ_data             : pd.DataFrame — merged_data.csv
+    static_forecasts_path : str   — path to static_forecasts.csv
+    horizon               : str   — '1y', '3y', or '5y'
+    qcew_path             : str   — path to qcew_long.csv
 
     Returns
     -------
     pd.DataFrame ranked by score descending, with all 159 counties
     """
-    business_age = max(0, CURRENT_YEAR - founding_year)
-    counties     = sorted(econ_data["County"].unique())
-    results      = []
+    business_age     = max(0, CURRENT_YEAR - founding_year)
+    counties         = sorted(econ_data["County"].unique())
+    results          = []
+    static_forecasts = _load_static_forecasts(static_forecasts_path)
 
     init_survival_model(qcew_path=qcew_path, merged_path="data/merged_data_v2.csv")
-    
+
     print(f"\nScoring {len(counties)} counties for '{sector}' ({horizon} horizon)...")
     print(f"Business: {employee_count} employees, ${current_revenue:,.0f} revenue, age {business_age}yr")
     print("-" * 60)
@@ -73,18 +80,24 @@ def score_all_counties(
         try:
             county_pop = _get_county_pop(county, econ_data)
 
-            forecasts = forecast_multiple_horizons(
-                county=county,
-                sector=sector,
-                df=econ_data,
-                base_year=BASE_DATA_YEAR,
-                model_path=model_path,
-                county_pop=county_pop, # for population dampening
-            )
+            key = (county, sector, horizon)
+            if key not in static_forecasts.index:
+                raise ValueError(f"No static forecast for ({county}, {sector}, {horizon})")
 
-            fc = forecasts.get(horizon)
-            if fc is None:
-                raise ValueError(f"No forecast returned for horizon {horizon}")
+            row_fc     = static_forecasts.loc[key]
+            fc         = {
+                "revenue_score":       row_fc["revenue_score"],
+                "total_growth":        row_fc["total_growth"],
+                "compound_multiplier": row_fc["compound_multiplier"],
+                "annual_growth_rate":  row_fc["annual_growth_rate"],
+                "economic_adjustment": row_fc["economic_adjustment"],
+                "class_probs": [
+                    row_fc["p_shrinking"],
+                    row_fc["p_flat"],
+                    row_fc["p_moderate"],
+                    row_fc["p_strong"],
+                ],
+            }
 
             p_survival = compute_survival_probability(
                 sector=sector,
@@ -220,7 +233,7 @@ def print_summary(df: pd.DataFrame, sector: str, horizon: str, top_n: int = 10):
     print()
 
 
-def predict(sector: str, current_revenue: float, employee_count: int, founding_year: int, data_path: str, model_path: str, horizon: str = "3y"):
+def predict(sector: str, current_revenue: float, employee_count: int, founding_year: int, data_path: str, static_forecasts_path: str, horizon: str = "3y"):
     econ_data = pd.read_csv(data_path).sort_values(["County", "Year"])
     print(f"Loaded {econ_data['County'].nunique()} counties")
 
@@ -230,7 +243,7 @@ def predict(sector: str, current_revenue: float, employee_count: int, founding_y
         employee_count=employee_count,
         founding_year=founding_year,
         econ_data=econ_data,
-        model_path=model_path,
+        static_forecasts_path=static_forecasts_path,
         horizon=horizon
     )
 
@@ -239,37 +252,26 @@ def predict(sector: str, current_revenue: float, employee_count: int, founding_y
     return ranked.to_dict(orient="records")
 
 
-# # CLi
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser(description="TerraTrends County Expansion Ranker")
+# CLI
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="TerraTrends County Expansion Ranker")
 
-#     parser.add_argument("--sector",        type=str,   help="Business sector")
-#     parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
-#     parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
-#     parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
-#     parser.add_argument("--horizon",       type=str,   default="5y",   choices=["1y","3y","5y"])
+    parser.add_argument("--sector",        type=str,   required=True, help="Business sector")
+    parser.add_argument("--revenue",       type=float, default=500000, help="Current annual revenue")
+    parser.add_argument("--employees",     type=int,   default=10,     help="Employee count")
+    parser.add_argument("--founding-year", type=int,   default=2015,   help="Year founded")
+    parser.add_argument("--horizon",       type=str,   default="3y",   choices=["1y","3y","5y"])
+    parser.add_argument("--data",          type=str,   default="data/merged_data_v2.csv")
+    parser.add_argument("--static-forecasts", type=str, default="train_inference_scripts/static_forecasts.csv")
 
-#     parser.add_argument("--input",      type=str, help="Batch input CSV")
-#     parser.add_argument("--data",   type=str, default="data/merged_data_v2.csv")
-#     parser.add_argument("--model",  type=str, default="lstm_model_v2.pt")
+    args = parser.parse_args()
 
-#     args = parser.parse_args()
-
-#     if args.sector:
-#         predict(
-#             sector=args.sector,
-#             current_revenue=args.revenue,
-#             employee_count=args.employees,
-#             founding_year=args.founding_year,
-#             data_path=args.data,
-#             model_path=args.model,
-#             horizon=args.horizon
-#         )
-#     else:
-#         print("Provide either --sector (single mode) or --input (batch mode)")
-#         print()
-#         print("Example:")
-#         print('  python score_engine.py --sector "Health care and social assistance" \\')
-#         print('                         --revenue 500000 --employees 8 \\')
-#         print('                         --founding-year 2015 --horizon 3y')
-#         sys.exit(1)
+    predict(
+        sector=args.sector,
+        current_revenue=args.revenue,
+        employee_count=args.employees,
+        founding_year=args.founding_year,
+        data_path=args.data,
+        static_forecasts_path=args.static_forecasts,
+        horizon=args.horizon,
+    )

@@ -23,7 +23,7 @@ class PredictionRequest(BaseModel):
 @app.post("/analysis/predict")
 def make_pred(request: PredictionRequest):
     econ_data = "data/merged_data_v2.csv"
-    model_path = "lstm_model_v2.pt"
+    static_forecasts_path = "train_inference_scripts/static_forecasts.csv"
     return predict(request.sector, request.revenue, request.employee_count,
-                   request.founding_year, econ_data, model_path, request.horizon)
+                   request.founding_year, econ_data, static_forecasts_path, request.horizon)
 
